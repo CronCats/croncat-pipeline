@@ -1,7 +1,7 @@
 &nbsp;
 
 <div align="center">
-<img width="600" src="https://github.com/CronCats/croncat-rs/raw/main/croncat.png" />
+<img width="300" src="https://github.com/CronCats/croncat-rs/raw/main/croncat.png" />
 </div>
 
 &nbsp;
