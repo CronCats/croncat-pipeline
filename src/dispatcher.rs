@@ -7,23 +7,42 @@ use tokio::sync::{broadcast, mpsc};
 /// Fanout messages from a single source to multiple consumers.
 ///
 pub struct Dispatcher<T> {
-    pub inbound: mpsc::UnboundedReceiver<T>,
-    pub outbound: broadcast::Sender<T>,
+    pub(crate) inbound: mpsc::UnboundedReceiver<T>,
+    pub(crate) outbound: broadcast::Sender<T>,
+    pub(crate) shutdown: broadcast::Receiver<()>,
 }
 
 impl<T> Dispatcher<T>
 where
     T: Clone + Debug + Send + Sync + 'static,
 {
-    pub fn new(inbound: mpsc::UnboundedReceiver<T>, outbound: broadcast::Sender<T>) -> Self {
-        Self { inbound, outbound }
+    pub fn new(
+        inbound: mpsc::UnboundedReceiver<T>,
+        outbound: broadcast::Sender<T>,
+        shutdown: broadcast::Receiver<()>,
+    ) -> Self {
+        Self {
+            inbound,
+            outbound,
+            shutdown,
+        }
     }
 
-    pub async fn fanout(&mut self) -> Result<()> {
-        while let Some(item) = self.inbound.recv().await {
-            self.outbound.send(item.clone())?;
+    #[mutants::skip]
+    pub async fn fanout(mut self) -> Result<()> {
+        let handler = tokio::spawn(async move {
+            while let Some(item) = self.inbound.recv().await {
+                self.outbound.send(item.clone())?;
+            }
+            Ok(())
+        });
+
+        tokio::select! {
+            _ = self.shutdown.recv() => Ok(()),
+            result = handler => {
+                result?
+            }
         }
-        Ok(())
     }
 }
 
@@ -41,9 +60,10 @@ mod tests {
         // Create channels for inbound and outbound
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (outbound_tx, _outbound_rx) = broadcast::channel(100);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         // Create a dispatcher
-        let mut dispatcher = Dispatcher::new(inbound_rx, outbound_tx.clone());
+        let dispatcher = Dispatcher::new(inbound_rx, outbound_tx.clone(), shutdown_rx);
 
         // Spawn a task to fanout
         let dispatcher_handle = tokio::spawn(async move {
@@ -72,9 +92,8 @@ mod tests {
             handle.await.unwrap();
         }
 
-        // Drop senders to signal end of stream
-        drop(inbound_tx);
-        drop(outbound_tx);
+        // Shutdown the system
+        shutdown_tx.send(()).unwrap();
 
         // Wait for dispatcher to complete
         let _ = try_join!(dispatcher_handle).unwrap();

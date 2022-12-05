@@ -1,6 +1,6 @@
 [package]
 name = "croncat-pipeline"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "AGPL-3.0"
 keywords = ["croncat", "pipeline", "async", "streaming", "data", "processing", "topology"]
@@ -17,4 +17,5 @@ readme = "README.md"
 async-stream = "0.3.3"
 color-eyre = "0.6.2"
 futures = "0.3.24"
+mutants = "0.0.3"
 tokio = { version = "1.21.2", features = ["macros", "rt", "sync", "time"] }
