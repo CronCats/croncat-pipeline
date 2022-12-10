@@ -3,7 +3,7 @@
 use color_eyre::Result;
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
 use std::{fmt::Debug, pin::Pin, sync::Arc};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::util::LastSeen;
 
@@ -53,6 +53,7 @@ where
     pub(crate) state: Arc<Mutex<ProviderState<T>>>,
     pub(crate) stream: Pin<Box<S>>,
     pub(crate) outbound: mpsc::UnboundedSender<T>,
+    pub(crate) shutdown: broadcast::Receiver<()>,
 }
 
 impl<T, S> Provider<T, S>
@@ -60,18 +61,24 @@ where
     T: Ord + Clone + Debug + Send + Sync + 'static,
     S: Stream<Item = Result<T>> + Send,
 {
-    pub fn new(name: String, outbound: mpsc::UnboundedSender<T>, stream: S) -> Self {
+    pub fn new(
+        name: String,
+        outbound: mpsc::UnboundedSender<T>,
+        shutdown: broadcast::Receiver<()>,
+        stream: S,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ProviderState::new(name))),
-            stream: Box::pin(stream),
             outbound,
+            shutdown,
+            stream: Box::pin(stream),
         }
     }
 
     pub async fn run(
         state: Arc<Mutex<ProviderState<T>>>,
-        stream: &mut Pin<Box<S>>,
-        outbound: &mpsc::UnboundedSender<T>,
+        mut stream: Pin<Box<S>>,
+        outbound: mpsc::UnboundedSender<T>,
     ) -> Result<()> {
         while let Some(item) = stream.next().await {
             match item {
@@ -88,6 +95,8 @@ where
                 }
             }
         }
+        let mut state = state.lock().await;
+        state.status = ProviderStatus::Stopped;
         Ok(())
     }
 }
@@ -101,24 +110,30 @@ where
     S: Stream<Item = Result<T>> + Send,
 {
     pub providers: Vec<Provider<T, S>>,
-    pub outbound: mpsc::UnboundedSender<T>,
+    pub(crate) outbound: mpsc::UnboundedSender<T>,
+    pub(crate) shutdown: broadcast::Sender<()>,
 }
 
-impl<T, S> ProviderSystem<T, S>
+impl<'a, T, S> ProviderSystem<T, S>
 where
     T: Ord + Clone + Debug + Send + Sync + 'static,
-    S: Stream<Item = Result<T>> + Send,
+    S: Stream<Item = Result<T>> + Send + 'static,
 {
-    pub fn new(outbound: mpsc::UnboundedSender<T>) -> Self {
+    pub fn new(outbound: mpsc::UnboundedSender<T>, shutdown: broadcast::Sender<()>) -> Self {
         Self {
             providers: Vec::new(),
             outbound,
+            shutdown,
         }
     }
 
     pub fn add_provider_stream(&mut self, name: impl Into<String>, stream: S) {
-        self.providers
-            .push(Provider::new(name.into(), self.outbound.clone(), stream));
+        self.providers.push(Provider::new(
+            name.into(),
+            self.outbound.clone(),
+            self.shutdown.subscribe(),
+            stream,
+        ));
     }
 
     pub fn get_provider_states(&self) -> Vec<Arc<Mutex<ProviderState<T>>>> {
@@ -128,29 +143,40 @@ where
             .collect::<Vec<_>>()
     }
 
-    pub async fn produce(&mut self) -> Result<()> {
+    pub async fn produce(self) -> Result<()> {
         let mut provider_futures = FuturesUnordered::new();
+        let mut shutdown_rx = self.shutdown.subscribe();
 
-        for provider in self.providers.iter_mut() {
+        for provider in self.providers.into_iter() {
             provider_futures.push(Provider::run(
                 provider.state.clone(),
-                &mut provider.stream,
-                &provider.outbound,
+                provider.stream,
+                self.outbound.clone(),
             ));
         }
 
-        while let Some(result) = provider_futures.next().await {
-            result?;
-        }
+        let handle = tokio::spawn(async move {
+            while let Some(provider) = provider_futures.next().await {
+                provider?;
+            }
+            Ok(())
+        });
 
-        Ok(())
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                Ok(())
+            }
+            result = handle => {
+                result?
+            }
+        }
     }
 }
 
 ///
 /// State of the provider system monitor.
 ///
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderSystemMonitorState {
     AllProvidersStopped,
     ProblemProviders {
@@ -187,6 +213,7 @@ where
         }
     }
 
+    #[mutants::skip]
     pub async fn monitor(self, interval_millis: u64) -> Result<()> {
         loop {
             let mut current_provider_states = vec![];
@@ -228,6 +255,62 @@ where
             self.outbound.send(state).await?;
 
             tokio::time::sleep(std::time::Duration::from_millis(interval_millis)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::stream;
+    // use tokio::sync::broadcast;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_provider() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let provider = Provider::new(
+            "test".into(),
+            tx,
+            shutdown_rx,
+            stream::iter(vec![Ok(1), Ok(2), Ok(3)]),
+        );
+
+        tokio::spawn(async move {
+            Provider::run(provider.state, provider.stream, provider.outbound)
+                .await
+                .unwrap();
+        });
+
+        for i in 1..=3 {
+            assert_eq!(rx.recv().await.unwrap(), i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_system() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
+        let mut provider_system = ProviderSystem::new(tx, shutdown_tx.clone());
+
+        provider_system.add_provider_stream(
+            "test1",
+            stream::iter(vec![Ok(1), Ok(2), Ok(3), Ok(4), Ok(5)]),
+        );
+        provider_system.add_provider_stream(
+            "test2",
+            stream::iter(vec![Ok(6), Ok(7), Ok(8), Ok(9), Ok(10)]),
+        );
+
+        tokio::spawn(async move {
+            provider_system.produce().await.unwrap();
+        });
+
+        for i in 1..=10 {
+            assert_eq!(rx.recv().await.unwrap(), i);
         }
     }
 }
